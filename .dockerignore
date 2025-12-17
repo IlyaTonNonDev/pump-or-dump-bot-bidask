@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Environment variables and secrets
+.env
+secretkeys.env
+*.env
+!secretkeys.env.example
+
+# Logs
+*.log
+bot.log
+bot_test.log
+
+# Bot state and lock files
+bot_state.json
+.bot.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation (optional, можно оставить если нужна)
+# *.md
+# !README.md
+
