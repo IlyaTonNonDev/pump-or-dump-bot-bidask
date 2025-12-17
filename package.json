@@ -1,0 +1,31 @@
+{
+  "name": "pump-or-dump-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for managing Pump/Dump events for TONDEV token with automatic trading",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "ton",
+    "blockchain",
+    "crypto",
+    "trading",
+    "pump",
+    "dump"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^16.1.0",
+    "bip39": "^3.1.0",
+    "dotenv": "^17.2.3",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
