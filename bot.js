@@ -86,6 +86,7 @@ const ALLOWED_PUMP_DUMP_CHAT_ID = -1003117681845; // ID чата для pump/dum
 // provider_token нужен только для физических товаров и услуг
 const STARS_PROVIDER_TOKEN = process.env.TELEGRAM_STARS_PROVIDER_TOKEN || '';
 const FREE_SHOP_MODE = process.env.FREE_SHOP_MODE === 'true'; // Бесплатный тестовый режим магазина
+const SHOP_IMAGE_URL = 'https://raw.githubusercontent.com/IlyaTonNonDev/pump-or-dump-bot-bidask/main/gift.png';
 
 // ==================== БЛОКИРОВКА ТРАНЗАКЦИЙ ====================
 const DISABLE_TRANSACTIONS = process.env.DISABLE_TRANSACTIONS === 'true'; // Блокировка транзакций на выкуп/продажу TONDEV
@@ -1431,7 +1432,8 @@ bot.onText(/\/start(?:\s+(.+))?$/i, async (msg, match) => {
   
   inline_keyboard.push([{ text: '🎒 Инвентарь', callback_data: 'inventory:show' }]);
 
-  await bot.sendMessage(chatId, buildShopMessage(), {
+  await bot.sendPhoto(chatId, SHOP_IMAGE_URL, {
+    caption: buildShopMessage(),
     reply_markup: { inline_keyboard }
   });
 });
@@ -1455,7 +1457,8 @@ bot.onText(/\/shop$/i, async (msg) => {
   
   inline_keyboard.push([{ text: '🎒 Инвентарь', callback_data: 'inventory:show' }]);
 
-  await bot.sendMessage(chatId, buildShopMessage(), {
+  await bot.sendPhoto(chatId, SHOP_IMAGE_URL, {
+    caption: buildShopMessage(),
     reply_markup: { inline_keyboard }
   });
 });
