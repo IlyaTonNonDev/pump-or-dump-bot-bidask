@@ -204,3 +204,4 @@ pkill -f "node bot.js" && npm start  # Перезапустить
 
 
 
+

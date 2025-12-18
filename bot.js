@@ -80,6 +80,42 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 // Пример: const ALLOWED_PUMP_DUMP_CHAT_ID = -1001234567890;
 const ALLOWED_PUMP_DUMP_CHAT_ID = -1003117681845; // ID чата для pump/dump команд
 
+// ==================== МАГАЗИН БУСТЕРОВ ====================
+// ПРИМЕЧАНИЕ: Для цифровых товаров provider_token не требуется (можно использовать пустую строку)
+// Согласно документации: https://core.telegram.org/bots/payments-stars
+// provider_token нужен только для физических товаров и услуг
+const STARS_PROVIDER_TOKEN = process.env.TELEGRAM_STARS_PROVIDER_TOKEN || '';
+const FREE_SHOP_MODE = process.env.FREE_SHOP_MODE === 'true'; // Бесплатный тестовый режим магазина
+
+// ==================== БЛОКИРОВКА ТРАНЗАКЦИЙ ====================
+const DISABLE_TRANSACTIONS = process.env.DISABLE_TRANSACTIONS === 'true'; // Блокировка транзакций на выкуп/продажу TONDEV
+
+const STORE_ITEMS = {
+  pump10: {
+    id: 'pump10',
+    title: 'PUMP/DUMP +10',
+    priceStars: 12,
+    delta: 10,
+    description: 'Одноразово сдвигает результат ивента на ±10 через команды pump10/dump10. 100% Stars идут на выкуп $TONDEV.'
+  },
+  pump25: {
+    id: 'pump25',
+    title: 'PUMP/DUMP +25',
+    priceStars: 30,
+    delta: 25,
+    description: 'Одноразово сдвигает результат ивента на ±25 через команды pump25/dump25. 100% Stars идут на выкуп $TONDEV.'
+  },
+  pump50: {
+    id: 'pump50',
+    title: 'PUMP/DUMP +50',
+    priceStars: 60,
+    delta: 50,
+    description: 'Одноразово сдвигает результат ивента на ±50 через команды pump50/dump50. 100% Stars идут на выкуп $TONDEV.'
+  }
+};
+
+const STORE_ITEM_LIST = Object.values(STORE_ITEMS);
+
 // ==================== PUMP/DUMP EVENT STATE ====================
 let pumpDumpEvent = {
   isActive: false,
@@ -90,8 +126,14 @@ let pumpDumpEvent = {
   eventChatId: null // ID чата, где запущен ивент
 };
 
+// Инвентарь пользователей: { [userId]: { [itemId]: count } }
+let userInventory = {};
+
 // Блокировка для предотвращения race conditions
 let eventLock = false;
+
+// Персональные блокировки для пользователей (защита от спама применения бустеров)
+let userLocks = {}; // { [userId]: true/false }
 
 // Флаг для предотвращения множественных одновременных вызовов updateEventMessage при старте
 let isUpdatingEventMessage = false;
@@ -1177,6 +1219,50 @@ async function isAdmin(chatId, userId) {
 let saveStateQueue = Promise.resolve();
 let saveStateCounter = 0;
 
+function normalizeInventoryEntry(entry = {}) {
+  const normalized = {};
+  for (const itemKey of Object.keys(STORE_ITEMS)) {
+    const value = Number(entry[itemKey]);
+    if (!Number.isNaN(value) && value > 0) {
+      normalized[itemKey] = value;
+    }
+  }
+  return normalized;
+}
+
+function getUserInventory(userId) {
+  if (!userId) return {};
+  if (!userInventory[userId]) {
+    userInventory[userId] = {};
+  }
+  return userInventory[userId];
+}
+
+function getInventoryCount(userId, itemId) {
+  return userInventory[userId]?.[itemId] || 0;
+}
+
+function addInventoryItem(userId, itemId, amount = 1) {
+  if (!STORE_ITEMS[itemId] || !userId) return;
+  const inventory = getUserInventory(userId);
+  inventory[itemId] = (inventory[itemId] || 0) + amount;
+  saveState();
+}
+
+function consumeInventoryItem(userId, itemId) {
+  if (!STORE_ITEMS[itemId] || !userId) return false;
+  const inventory = getUserInventory(userId);
+  if ((inventory[itemId] || 0) <= 0) {
+    return false;
+  }
+  inventory[itemId] -= 1;
+  if (inventory[itemId] <= 0) {
+    delete inventory[itemId];
+  }
+  saveState();
+  return true;
+}
+
 function saveState() {
   saveStateCounter++;
   const currentCounter = saveStateCounter;
@@ -1184,6 +1270,14 @@ function saveState() {
   // Добавляем в очередь, но не блокируем выполнение
   saveStateQueue = saveStateQueue.then(async () => {
     try {
+      const inventoryForSave = {};
+      for (const [userId, items] of Object.entries(userInventory)) {
+        const normalized = normalizeInventoryEntry(items);
+        if (Object.keys(normalized).length > 0) {
+          inventoryForSave[userId] = normalized;
+        }
+      }
+
       const state = {
         pumpDumpEvent: {
           isActive: pumpDumpEvent.isActive,
@@ -1192,7 +1286,8 @@ function saveState() {
           dumpThreshold: pumpDumpEvent.dumpThreshold !== null && pumpDumpEvent.dumpThreshold !== undefined ? pumpDumpEvent.dumpThreshold : null,
           pinnedMessageId: pumpDumpEvent.pinnedMessageId !== null && pumpDumpEvent.pinnedMessageId !== undefined ? pumpDumpEvent.pinnedMessageId : null,
           eventChatId: pumpDumpEvent.eventChatId !== null && pumpDumpEvent.eventChatId !== undefined ? pumpDumpEvent.eventChatId : null
-        }
+        },
+        userInventory: inventoryForSave
       };
       
       // Сохраняем синхронно, но в фоне (не блокируем основной поток)
@@ -1236,6 +1331,21 @@ async function loadState() {
         console.log(`[LOAD_STATE] ℹ️ Event is active, message should already be pinned (${pumpDumpEvent.pinnedMessageId || 'not set'})`);
       }
     }
+
+    // Загружаем инвентарь магазина
+    userInventory = {};
+    if (state.userInventory && typeof state.userInventory === 'object') {
+      for (const [userId, items] of Object.entries(state.userInventory)) {
+        const normalized = normalizeInventoryEntry(items);
+        if (Object.keys(normalized).length > 0) {
+          userInventory[userId] = normalized;
+        }
+      }
+      const totalUsersWithInventory = Object.keys(userInventory).length;
+      if (totalUsersWithInventory > 0) {
+        console.log(`[LOAD_STATE] ✅ Loaded store inventory for ${totalUsersWithInventory} users`);
+      }
+    }
     
     return true;
   } catch (error) {
@@ -1247,6 +1357,419 @@ async function loadState() {
     return false;
   }
 }
+
+// ==================== МАГАЗИН И ТОВАРЫ ====================
+function buildShopMessage() {
+  const lines = [
+    '🛒 Магазин бустеров PUMP/DUMP',
+    '',
+    'Доступные товары:'
+  ];
+
+  for (const item of STORE_ITEM_LIST) {
+    const dumpCommand = item.id.replace('pump', 'dump');
+    const priceText = `${item.priceStars}⭐`;
+    lines.push(
+      `• ${item.title} — ${priceText}`,
+      `   Одноразово сдвигает результат ивента на ±${item.delta} через команды ${item.id}/${dumpCommand}.`,
+      ''
+    );
+  }
+
+  lines.push('Покупки можно делать неограниченно. Бустер списывается при использовании команды. 85% доходов идут на выкуп $TONDEV');
+  return lines.join('\n');
+}
+
+function buildInventoryMessage(userId) {
+  const lines = [
+    '🎒 Инвентарь бустеров',
+    '',
+    'Ваши бустеры:'
+  ];
+
+  let hasAnyItems = false;
+  for (const item of STORE_ITEM_LIST) {
+    const count = getInventoryCount(userId, item.id);
+    if (count > 0) {
+      hasAnyItems = true;
+      const dumpCommand = item.id.replace('pump', 'dump');
+      lines.push(
+        `• ${item.title}: ${count} шт.`,
+        `   Команды: ${item.id} / ${dumpCommand}`
+      );
+    }
+  }
+
+  if (!hasAnyItems) {
+    lines.push('У вас пока нет бустеров.');
+    lines.push('');
+    lines.push('Купите бустеры в магазине!');
+  }
+
+  return lines.join('\n');
+}
+
+// Обработчик команды /start - всегда показывает магазин
+bot.onText(/\/start(?:\s+(.+))?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  
+  // Команда /start работает только в приватных чатах с ботом
+  if (chatId <= 0) {
+    return;
+  }
+  
+  // Всегда показываем магазин при команде /start
+  const userId = msg.from?.id;
+  const inline_keyboard = [];
+  
+  // Обычный режим - только оплата
+  for (const item of STORE_ITEM_LIST) {
+    inline_keyboard.push([
+      { text: `${item.title} — ${item.priceStars}⭐`, callback_data: `buy:${item.id}` }
+    ]);
+  }
+  
+  inline_keyboard.push([{ text: '🎒 Инвентарь', callback_data: 'inventory:show' }]);
+
+  await bot.sendMessage(chatId, buildShopMessage(), {
+    reply_markup: { inline_keyboard }
+  });
+});
+
+bot.onText(/\/shop$/i, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  // Команда /shop работает только в приватных чатах с ботом
+  if (chatId <= 0) {
+    return bot.sendMessage(chatId, '🛒 Магазин доступен только в приватных сообщениях с ботом. Напишите боту в личку: @gfdgfdgdfbot');
+  }
+  
+  const inline_keyboard = [];
+  
+  // Обычный режим - только оплата
+  for (const item of STORE_ITEM_LIST) {
+    inline_keyboard.push([
+      { text: `${item.title} — ${item.priceStars}⭐`, callback_data: `buy:${item.id}` }
+    ]);
+  }
+  
+  inline_keyboard.push([{ text: '🎒 Инвентарь', callback_data: 'inventory:show' }]);
+
+  await bot.sendMessage(chatId, buildShopMessage(), {
+    reply_markup: { inline_keyboard }
+  });
+});
+
+bot.on('callback_query', async (query) => {
+  const data = query.data || '';
+  const userId = query.from?.id;
+  const chatId = query.message?.chat?.id || userId;
+
+  // Обработка показа инвентаря
+  if (data === 'inventory:show') {
+    if (!userId) {
+      return bot.answerCallbackQuery(query.id, { text: 'Не удалось определить пользователя', show_alert: true });
+    }
+
+    const inventoryText = buildInventoryMessage(userId);
+    
+    // Создаем клавиатуру с кнопками покупки для каждого товара
+    const inline_keyboard = [];
+    
+    if (FREE_SHOP_MODE) {
+      // В тестовом режиме показываем две опции
+      for (const item of STORE_ITEM_LIST) {
+        const count = getInventoryCount(userId, item.id);
+        const countText = count > 0 ? ` (${count} шт.)` : '';
+        inline_keyboard.push([
+          { text: `✅ ${item.title}${countText} — Получить бесплатно`, callback_data: `buy_free:${item.id}` }
+        ]);
+        inline_keyboard.push([
+          { text: `💳 ${item.title} — Тест оплаты ${item.priceStars}⭐`, callback_data: `buy_pay:${item.id}` }
+        ]);
+      }
+    } else {
+      // Обычный режим
+      for (const item of STORE_ITEM_LIST) {
+        const count = getInventoryCount(userId, item.id);
+        const buttonText = count > 0 
+          ? `${item.title} — ${count} шт. | Купить ${item.priceStars}⭐` 
+          : `${item.title} — ${item.priceStars}⭐`;
+        inline_keyboard.push([{ text: buttonText, callback_data: `buy:${item.id}` }]);
+      }
+    }
+    
+    inline_keyboard.push([{ text: '🛒 Вернуться в магазин', callback_data: 'shop:show' }]);
+
+    try {
+      await bot.editMessageText(inventoryText, {
+        chat_id: chatId,
+        message_id: query.message.message_id,
+        reply_markup: { inline_keyboard }
+      });
+      await bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      // Если не удалось отредактировать сообщение, отправляем новое
+      await bot.sendMessage(chatId, inventoryText, {
+        reply_markup: { inline_keyboard }
+      });
+      await bot.answerCallbackQuery(query.id);
+    }
+    return;
+  }
+
+  // Обработка возврата в магазин
+  if (data === 'shop:show') {
+    if (!userId) {
+      return bot.answerCallbackQuery(query.id, { text: 'Не удалось определить пользователя', show_alert: true });
+    }
+
+    const shopText = buildShopMessage();
+    const inline_keyboard = [];
+    
+    // В тестовом режиме показываем две опции: бесплатно и тест оплаты
+    if (FREE_SHOP_MODE) {
+      for (const item of STORE_ITEM_LIST) {
+        inline_keyboard.push([
+          { text: `✅ ${item.title} — Получить бесплатно`, callback_data: `buy_free:${item.id}` }
+        ]);
+        inline_keyboard.push([
+          { text: `💳 ${item.title} — Тест оплаты ${item.priceStars}⭐`, callback_data: `buy_pay:${item.id}` }
+        ]);
+      }
+    } else {
+      // Обычный режим - только оплата
+      for (const item of STORE_ITEM_LIST) {
+        inline_keyboard.push([
+          { text: `${item.title} — ${item.priceStars}⭐`, callback_data: `buy:${item.id}` }
+        ]);
+      }
+    }
+    
+    inline_keyboard.push([{ text: '🎒 Инвентарь', callback_data: 'inventory:show' }]);
+
+    try {
+      await bot.editMessageText(shopText, {
+        chat_id: chatId,
+        message_id: query.message.message_id,
+        reply_markup: { inline_keyboard }
+      });
+      await bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      await bot.sendMessage(chatId, shopText, {
+        reply_markup: { inline_keyboard }
+      });
+      await bot.answerCallbackQuery(query.id);
+    }
+    return;
+  }
+
+  // Обработка покупки товара
+  // Поддерживаем: buy:itemId (обычная покупка), buy_free:itemId (бесплатно), buy_pay:itemId (тест оплаты)
+  let itemId;
+  let purchaseType = 'normal'; // 'normal', 'free', 'pay'
+  
+  if (data.startsWith('buy_free:')) {
+    purchaseType = 'free';
+    itemId = data.split(':')[1];
+  } else if (data.startsWith('buy_pay:')) {
+    purchaseType = 'pay';
+    itemId = data.split(':')[1];
+  } else if (data.startsWith('buy:')) {
+    purchaseType = 'normal';
+    itemId = data.split(':')[1];
+  } else {
+    return; // Не наш callback
+  }
+
+  const item = STORE_ITEMS[itemId];
+
+  if (!item) {
+    return bot.answerCallbackQuery(query.id, { text: 'Товар не найден', show_alert: true });
+  }
+
+  // Бесплатное получение (buy_free или FREE_SHOP_MODE с обычной покупкой)
+  if (purchaseType === 'free' || (FREE_SHOP_MODE && purchaseType === 'normal')) {
+    if (!userId) {
+      return bot.answerCallbackQuery(query.id, { text: 'Не удалось определить пользователя', show_alert: true });
+    }
+
+    // Выдаем товар бесплатно
+    addInventoryItem(userId, item.id, 1);
+    const dumpCommand = item.id.replace('pump', 'dump');
+    const total = getInventoryCount(userId, item.id);
+
+    await bot.answerCallbackQuery(query.id, { text: `✅ ${item.title} добавлен в инвентарь!`, show_alert: false });
+    
+    // Определяем, из какого сообщения пришла покупка (магазин или инвентарь)
+    const messageText = query.message?.text || '';
+    const isFromInventory = messageText.includes('Инвентарь');
+
+    // Обновляем сообщение в зависимости от того, откуда пришла покупка
+    if (isFromInventory) {
+      const inventoryText = buildInventoryMessage(userId);
+      const inline_keyboard = [];
+      
+      // Обычный режим: только покупка за Stars
+      for (const storeItem of STORE_ITEM_LIST) {
+        const count = getInventoryCount(userId, storeItem.id);
+        const buttonText = count > 0 
+          ? `${storeItem.title} — ${count} шт. | Купить ${storeItem.priceStars}⭐` 
+          : `${storeItem.title} — ${storeItem.priceStars}⭐`;
+        inline_keyboard.push([{ text: buttonText, callback_data: `buy:${storeItem.id}` }]);
+      }
+      
+      inline_keyboard.push([{ text: '🛒 Вернуться в магазин', callback_data: 'shop:show' }]);
+
+      try {
+        await bot.editMessageText(inventoryText, {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          reply_markup: { inline_keyboard }
+        });
+      } catch (error) {
+        // Если не удалось обновить, отправляем новое сообщение
+        await bot.sendMessage(userId, inventoryText, {
+          reply_markup: { inline_keyboard }
+        });
+      }
+    } else {
+      // Обновляем магазин
+      const shopText = buildShopMessage();
+      const inline_keyboard = [];
+      
+      // Обычный режим - только оплата
+      for (const storeItem of STORE_ITEM_LIST) {
+        inline_keyboard.push([
+          { text: `${storeItem.title} — ${storeItem.priceStars}⭐`, callback_data: `buy:${storeItem.id}` }
+        ]);
+      }
+      
+      inline_keyboard.push([{ text: '🎒 Инвентарь', callback_data: 'inventory:show' }]);
+
+      try {
+        await bot.editMessageText(shopText, {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          reply_markup: { inline_keyboard }
+        });
+      } catch (error) {
+        // Если не удалось обновить, отправляем новое сообщение
+        await bot.sendMessage(userId, shopText, {
+          reply_markup: { inline_keyboard }
+        });
+      }
+    }
+
+    console.log(`[SHOP] ✅ Free item granted: ${item.title} to user ${userId}`);
+    return;
+  }
+
+  // Оплата Stars (обычный режим или тест оплаты в тестовом режиме)
+  // Для цифровых товаров provider_token не требуется (можно использовать пустую строку)
+  // Согласно документации: https://core.telegram.org/bots/payments-stars
+  if (!userId) {
+    return bot.answerCallbackQuery(query.id, { text: 'Не удалось определить пользователя', show_alert: true });
+  }
+
+  const payload = JSON.stringify({ type: 'store_purchase', itemId: item.id });
+
+  try {
+    // Отправляем инвойс в приватный чат пользователя, а не в групповой чат
+    // provider_token пустой для цифровых товаров (не требуется по документации Telegram)
+    // prices должен быть массивом объектов с полями label (string) и amount (number)
+    const prices = [{
+      label: String(item.title), // Явно преобразуем в строку
+      amount: parseInt(String(item.priceStars), 10) // Явно преобразуем в целое число
+    }];
+    
+    // startParameter должен быть уникальной строкой для каждого инвойса
+    const startParameter = `buy_${item.id}_${Date.now()}`;
+    
+    console.log(`[SHOP] Sending invoice: userId=${userId}, title=${item.title}, prices=`, JSON.stringify(prices));
+    
+    // Используем прямой HTTP вызов к Telegram Bot API для обхода возможных проблем с библиотекой
+    const invoiceData = {
+      chat_id: userId,
+      title: String(item.title),
+      description: String(item.description),
+      payload: payload,
+      provider_token: '', // Пустая строка для цифровых товаров
+      start_parameter: startParameter,
+      currency: 'XTR',
+      prices: prices,
+      reply_markup: {
+        inline_keyboard: [[{ text: `Оплатить ${item.priceStars}⭐`, pay: true }]]
+      }
+    };
+    
+    console.log(`[SHOP] Invoice data:`, JSON.stringify(invoiceData, null, 2));
+    
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendInvoice`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(invoiceData)
+    });
+    
+    const result = await response.json();
+    
+    if (!result.ok) {
+      throw new Error(`Telegram API error: ${result.description || JSON.stringify(result)}`);
+    }
+    
+    console.log(`[SHOP] ✅ Invoice sent successfully via direct API call`);
+
+    await bot.answerCallbackQuery(query.id, { text: 'Счет отправлен в личные сообщения', show_alert: false });
+  } catch (error) {
+    console.error(`[SHOP] ❌ Error sending invoice:`, error.message);
+    await bot.answerCallbackQuery(query.id, { text: `Не удалось отправить счет: ${error.message}`, show_alert: true });
+  }
+});
+
+bot.on('pre_checkout_query', async (checkout) => {
+  try {
+    await bot.answerPreCheckoutQuery(checkout.id, true);
+  } catch (error) {
+    console.error(`[SHOP] ❌ Error in pre_checkout_query:`, error.message);
+  }
+});
+
+bot.on('message', async (msg) => {
+  if (!msg.successful_payment) return;
+
+  const payment = msg.successful_payment;
+  const payloadRaw = payment.invoice_payload;
+  let payload;
+
+  try {
+    payload = JSON.parse(payloadRaw);
+  } catch (error) {
+    return;
+  }
+
+  if (!payload || payload.type !== 'store_purchase') {
+    return;
+  }
+
+  const item = STORE_ITEMS[payload.itemId];
+  const userId = msg.from?.id;
+
+  if (!item || !userId) return;
+
+  addInventoryItem(userId, item.id, 1);
+  const dumpCommand = item.id.replace('pump', 'dump');
+  const total = getInventoryCount(userId, item.id);
+
+  // Отправляем сообщение в приватный чат пользователя, а не в групповой чат
+  await bot.sendMessage(
+    userId,
+    `✅ Оплата ${item.title} за ${item.priceStars}⭐ подтверждена.\n` +
+    `Доступно в инвентаре: ${total} шт.\n` +
+    `Используйте команды ${item.id} или ${dumpCommand}, чтобы сдвинуть результат на ${item.delta}.`
+  ).catch(() => {});
+});
 
 // ==================== PUMP/DUMP EVENT FUNCTIONS ====================
 // Функция для отправки/обновления сообщения об ивенте
@@ -1277,14 +1800,16 @@ async function updateEventMessage(chatId) {
     // Получаем актуальный баланс для отображения
     const { tonBalance, tondevBalance } = await calculateDynamicThresholds(true);
     
-    const messageText = `🎯 Ивент запущен! Текущий результат: ${pumpDumpEvent.finishResult > 0 ? '+' : ''}${pumpDumpEvent.finishResult}\n\nИспользуйте /pump (+1) или /dump (-1) для изменения результата.\n\n💰 Текущий баланс кошелька:\n• TON: ${tonBalance.toFixed(4)}\n• TONDEV: ${tondevBalance.toFixed(4)}\n\n📊 Динамические пороги (зафиксированы при старте):\n• Pump: +${pumpDumpEvent.pumpThreshold} (для покупки)\n• Dump: -${pumpDumpEvent.dumpThreshold} (для продажи)\n\n💡 Пороги рассчитываются автоматически на основе соотношения TONDEV и TON на балансе кошелька и фиксируются при старте ивента.`;
+    const shopLink = 'https://t.me/gfdgfdgdfbot?start=shop';
+    const messageText = `🎯 Ивент запущен! Текущий результат: ${pumpDumpEvent.finishResult > 0 ? '+' : ''}${pumpDumpEvent.finishResult}\n\nИспользуйте /pump (+1) или /dump (-1) для изменения результата.\n\n🛒 <a href="${shopLink}">Магазин бустеров</a> — усильте влияние на результат!\n\n💰 Текущий баланс кошелька:\n• TON: ${tonBalance.toFixed(4)}\n• TONDEV: ${tondevBalance.toFixed(4)}\n\n📊 Динамические пороги (зафиксированы при старте):\n• Pump: +${pumpDumpEvent.pumpThreshold} (для покупки)\n• Dump: -${pumpDumpEvent.dumpThreshold} (для продажи)\n\n💡 Пороги рассчитываются автоматически на основе соотношения TONDEV и TON на балансе кошелька и фиксируются при старте ивента.`;
     
     // Если есть закрепленное сообщение, обновляем его (при командах /pump и /dump)
     if (pumpDumpEvent.pinnedMessageId) {
       try {
         await bot.editMessageText(messageText, {
           chat_id: chatId,
-          message_id: pumpDumpEvent.pinnedMessageId
+          message_id: pumpDumpEvent.pinnedMessageId,
+          parse_mode: 'HTML'
         });
         console.log(`[EVENT_MESSAGE] ✅ Updated pinned message ${pumpDumpEvent.pinnedMessageId}`);
         isUpdatingEventMessage = false; // Сбрасываем флаг после успешного обновления
@@ -1318,7 +1843,7 @@ async function updateEventMessage(chatId) {
     }
     
     // Отправляем новое сообщение и закрепляем его (если не было закрепленного сообщения)
-    const sentMessage = await bot.sendMessage(chatId, messageText);
+    const sentMessage = await bot.sendMessage(chatId, messageText, { parse_mode: 'HTML' });
     
     // Еще раз проверяем, что pinnedMessageId не установлен (race condition protection)
     // Если установлен, значит другой запрос успел отправить и закрепить сообщение
@@ -1458,14 +1983,21 @@ async function checkEventCompletion(chatId) {
       const message = Array(10).fill('❗️LEEEET\'S PUMP TONDEV❗️').join('\n');
       await bot.sendMessage(chatId, message);
       
-      // Автоматическая покупка TONDEV (асинхронно, не блокируем)
-      console.log(`[PUMP/DUMP] 🚀 Triggering automatic TONDEV purchase...`);
-      buyTondev(chatId).catch(err => {
-        console.error(`[PUMP/DUMP] Error in buyTondev:`, err.message);
-      }).finally(() => {
-        // Снимаем флаг после завершения транзакции (успешной или с ошибкой)
+      // Проверяем, не заблокированы ли транзакции
+      if (DISABLE_TRANSACTIONS) {
+        console.log(`[PUMP/DUMP] 🚫 Transactions disabled - skipping TONDEV purchase`);
+        await bot.sendMessage(chatId, `⚠️ Транзакции заблокированы (тестовый режим). Покупка TONDEV не выполнена.`);
         isProcessingTransaction = false;
-      });
+      } else {
+        // Автоматическая покупка TONDEV (асинхронно, не блокируем)
+        console.log(`[PUMP/DUMP] 🚀 Triggering automatic TONDEV purchase...`);
+        buyTondev(chatId).catch(err => {
+          console.error(`[PUMP/DUMP] Error in buyTondev:`, err.message);
+        }).finally(() => {
+          // Снимаем флаг после завершения транзакции (успешной или с ошибкой)
+          isProcessingTransaction = false;
+        });
+      }
       
       return; // Выходим, чтобы не снимать eventLock дважды
     } else if (pumpDumpEvent.finishResult <= -dumpThreshold) {
@@ -1492,14 +2024,21 @@ async function checkEventCompletion(chatId) {
       const message = Array(10).fill('❗️LEEEET\'S DUMP TONDEV❗️').join('\n');
       await bot.sendMessage(chatId, message);
       
-      // Автоматическая продажа всех TONDEV токенов (асинхронно, не блокируем)
-      console.log(`[PUMP/DUMP] 🚀 Triggering automatic TONDEV sale...`);
-      sellTondev(chatId).catch(err => {
-        console.error(`[PUMP/DUMP] Error in sellTondev:`, err.message);
-      }).finally(() => {
-        // Снимаем флаг после завершения транзакции (успешной или с ошибкой)
+      // Проверяем, не заблокированы ли транзакции
+      if (DISABLE_TRANSACTIONS) {
+        console.log(`[PUMP/DUMP] 🚫 Transactions disabled - skipping TONDEV sale`);
+        await bot.sendMessage(chatId, `⚠️ Транзакции заблокированы (тестовый режим). Продажа TONDEV не выполнена.`);
         isProcessingTransaction = false;
-      });
+      } else {
+        // Автоматическая продажа всех TONDEV токенов (асинхронно, не блокируем)
+        console.log(`[PUMP/DUMP] 🚀 Triggering automatic TONDEV sale...`);
+        sellTondev(chatId).catch(err => {
+          console.error(`[PUMP/DUMP] Error in sellTondev:`, err.message);
+        }).finally(() => {
+          // Снимаем флаг после завершения транзакции (успешной или с ошибкой)
+          isProcessingTransaction = false;
+        });
+      }
       
       return; // Выходим, чтобы не снимать eventLock дважды
     } else {
@@ -1677,6 +2216,157 @@ bot.onText(/\/stopEvent$/i, async (msg) => {
     console.log(`[/STOPEVENT] ✅ Event stopped by user ${userId} in chat ${chatId}. Final result was: ${finalResult}`);
     
     bot.sendMessage(chatId, `🛑 Ивент остановлен администратором.\n\nФинальный результат: ${finalResult > 0 ? '+' : ''}${finalResult}`).catch(() => {});
+});
+
+// ==================== КОМАНДЫ БУСТЕРОВ ИЗ МАГАЗИНА ====================
+async function handleInventoryCommand(msg, itemId, delta) {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id;
+    const item = STORE_ITEMS[itemId];
+
+    if (!item) {
+        return;
+    }
+
+    // Проверяем, что команда отправлена в разрешенном чате
+    if (ALLOWED_PUMP_DUMP_CHAT_ID !== null && chatId !== ALLOWED_PUMP_DUMP_CHAT_ID) {
+        return; // Просто игнорируем команду
+    }
+
+    if (!userId) {
+        return bot.sendMessage(chatId, 'Не удалось определить пользователя для списания бустера.');
+    }
+
+    // Проверяем, является ли пользователь админом (кроме ID 367102417)
+    if (userId && userId !== 367102417) {
+        const userIsAdmin = await isAdmin(chatId, userId);
+        if (userIsAdmin) {
+            return bot.sendMessage(chatId, 'Админы не могут участовать в PUMP или DUMP $TONDEV. Снимите с себя админку и попробуйте позже');
+        }
+    }
+
+    if (!pumpDumpEvent.isActive) {
+        return bot.sendMessage(chatId, 'На данный момент нет активного ивента. Попроси админа запустить /pumpOrDump, чтобы использовать бустер.');
+    }
+
+    // Защита от спама: персональная блокировка для пользователя
+    if (userLocks[userId]) {
+        bot.sendMessage(chatId, `⏳ Ваша предыдущая команда еще обрабатывается, подождите...`).catch(() => {});
+        return;
+    }
+
+    // Защита от race conditions с retry механизмом
+    let retryCount = 0;
+    const maxRetries = 10; // До 10 попыток (1 секунда максимум)
+    const retryDelay = 100; // 100ms между попытками
+
+    while (eventLock && retryCount < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        retryCount++;
+    }
+
+    if (eventLock) {
+        bot.sendMessage(chatId, `⏳ Команда обрабатывается, попробуйте через секунду...`).catch(() => {});
+        return; // Игнорируем команду если идет обработка
+    }
+
+    // Устанавливаем блокировки
+    eventLock = true;
+    userLocks[userId] = true;
+    
+    let currentResult = pumpDumpEvent.finishResult;
+    let actualDelta = delta; // Реальное изменение (может быть уменьшено если нет бустеров)
+    let usedBooster = false;
+    
+    try {
+        // Проверяем, что ивент еще активен (мог быть завершен другим процессом)
+        if (!pumpDumpEvent.isActive) {
+            console.log(`[BOOSTER] ⚠️ Event is not active, ignoring command`);
+            eventLock = false;
+            delete userLocks[userId];
+            return;
+        }
+
+        // Проверяем количество бустеров ВНУТРИ блокировки (защита от спама)
+        const boosterCount = getInventoryCount(userId, itemId);
+        
+        if (boosterCount > 0) {
+            // Есть бустеры - списываем и применяем полный дельту
+            const consumed = consumeInventoryItem(userId, itemId);
+            if (consumed) {
+                usedBooster = true;
+                actualDelta = delta; // Применяем полный дельту бустера
+                console.log(`[BOOSTER] ✅ Booster ${item.title} consumed by user ${userId}, applying ${delta > 0 ? '+' : ''}${delta}`);
+            } else {
+                // Не удалось списать (редкий случай)
+                actualDelta = 1; // Применяем только +1
+                console.log(`[BOOSTER] ⚠️ Failed to consume booster, applying +1 instead`);
+            }
+        } else {
+            // Нет бустеров - применяем только +1 вместо полного дельты бустера
+            actualDelta = delta > 0 ? 1 : -1; // +1 или -1 вместо полного дельты
+            console.log(`[BOOSTER] ⚠️ No boosters available for user ${userId}, applying ${actualDelta > 0 ? '+' : ''}${actualDelta} instead of ${delta > 0 ? '+' : ''}${delta}`);
+        }
+
+        // Применяем изменение
+        pumpDumpEvent.finishResult += actualDelta;
+        currentResult = pumpDumpEvent.finishResult;
+        saveState(); // Асинхронное сохранение без await
+
+        console.log(`[BOOSTER] ✅ ${actualDelta > 0 ? '+' : ''}${actualDelta} to finishResult by user ${userId}, new value: ${currentResult}`);
+    } catch (err) {
+        console.error(`[BOOSTER] ❌ Unexpected error:`, err.message);
+        throw err;
+    } finally {
+        eventLock = false;
+        // Снимаем персональную блокировку пользователя
+        delete userLocks[userId];
+    }
+
+    // Проверяем, не достигнут ли порог (используем кэш порогов)
+    if (pumpDumpEvent.isActive && !isProcessingTransaction) {
+        checkEventCompletion(chatId).catch(err => {
+            console.error(`[BOOSTER] ❌ Error in checkEventCompletion:`, err.message);
+        });
+    }
+
+    // Обновляем закрепленное сообщение
+    if (pumpDumpEvent.isActive) {
+        updateEventMessage(chatId).catch(err => {
+            console.error(`[BOOSTER] Error updating event message:`, err.message);
+        });
+    }
+
+    const remaining = getInventoryCount(userId, itemId);
+    const actualDeltaText = `${actualDelta > 0 ? '+' : ''}${actualDelta}`;
+    const newResultText = currentResult > 0 ? `+${currentResult}` : `${currentResult}`;
+    
+    let messageText;
+    if (usedBooster) {
+        // Бустер был использован
+        messageText = `🔥 Бустер ${item.title} применён (${actualDeltaText}). Текущий результат: ${newResultText}. Осталось бустеров: ${remaining}.`;
+    } else {
+        // Бустеров не было, применен только +1/-1
+        const expectedDeltaText = `${delta > 0 ? '+' : ''}${delta}`;
+        messageText = `⚠️ У тебя нет бустера ${item.title}. Применено только ${actualDeltaText} вместо ${expectedDeltaText}. Текущий результат: ${newResultText}.\n\nКупи бустеры в магазине: /shop`;
+    }
+    
+    bot.sendMessage(chatId, messageText).catch(err => {
+        console.error(`[BOOSTER] Error sending message:`, err.message);
+    });
+}
+
+const INVENTORY_COMMANDS = [
+    { regex: /^\/?pump10$/i, itemId: 'pump10', delta: 10 },
+    { regex: /^\/?dump10$/i, itemId: 'pump10', delta: -10 },
+    { regex: /^\/?pump25$/i, itemId: 'pump25', delta: 25 },
+    { regex: /^\/?dump25$/i, itemId: 'pump25', delta: -25 },
+    { regex: /^\/?pump50$/i, itemId: 'pump50', delta: 50 },
+    { regex: /^\/?dump50$/i, itemId: 'pump50', delta: -50 },
+];
+
+INVENTORY_COMMANDS.forEach(({ regex, itemId, delta }) => {
+    bot.onText(regex, (msg) => handleInventoryCommand(msg, itemId, delta));
 });
 
 // ==================== КОМАНДА /PUMP ====================
@@ -1884,6 +2574,8 @@ bot.onText(/\/eventstatus$/i, async (msg) => {
   
   console.log('Bot started. Pump/Dump event system ready.');
   console.log(`Allowed chat ID: ${ALLOWED_PUMP_DUMP_CHAT_ID || 'all chats (protection disabled)'}`);
+  console.log(`Shop mode: ${FREE_SHOP_MODE ? '🧪 FREE TEST MODE (items granted without payment)' : '💰 NORMAL MODE (Stars payment required)'}`);
+  console.log(`Transactions: ${DISABLE_TRANSACTIONS ? '🚫 DISABLED (test mode - no buy/sell TONDEV)' : '✅ ENABLED (production mode)'}`);
 })();
 
 process.on('unhandledRejection', console.error);
