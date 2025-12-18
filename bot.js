@@ -1807,7 +1807,7 @@ async function updateEventMessage(chatId) {
     // Получаем актуальный баланс для отображения
     const { tonBalance, tondevBalance } = await calculateDynamicThresholds(true);
     
-    const shopLink = 'https://t.me/gfdgfdgdfbot?start=shop';
+    const shopLink = 'https://t.me/pumpordumprobot?start=shop';
     const messageText = `🎯 Ивент запущен! Текущий результат: ${pumpDumpEvent.finishResult > 0 ? '+' : ''}${pumpDumpEvent.finishResult}\n\nИспользуйте /pump (+1) или /dump (-1) для изменения результата.\n\n🛒 <a href="${shopLink}">Магазин бустеров</a> — усильте влияние на результат!\n\n💰 Текущий баланс кошелька:\n• TON: ${tonBalance.toFixed(4)}\n• TONDEV: ${tondevBalance.toFixed(4)}\n\n📊 Динамические пороги (зафиксированы при старте):\n• Pump: +${pumpDumpEvent.pumpThreshold} (для покупки)\n• Dump: -${pumpDumpEvent.dumpThreshold} (для продажи)\n\n💡 Пороги рассчитываются автоматически на основе соотношения TONDEV и TON на балансе кошелька и фиксируются при старте ивента.`;
     
     // Если есть закрепленное сообщение, обновляем его (при командах /pump и /dump)
