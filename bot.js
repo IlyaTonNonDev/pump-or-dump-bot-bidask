@@ -2456,7 +2456,8 @@ bot.onText(/^\/pump(?:\s|$)/i, async (msg) => {
             // Отправляем ответ пользователю
             bot.sendMessage(
                 chatId,
-                `📈 PUMP! Текущий результат: ${currentResult > 0 ? '+' : ''}${currentResult}\n🛒 Магазин бустов: https://t.me/pumpordumprobot?start=shop`
+                `📈 PUMP! Текущий результат: ${currentResult > 0 ? '+' : ''}${currentResult}\n🛒 Магазин бустов: https://t.me/pumpordumprobot?start=shop`,
+                { disable_web_page_preview: true }
             ).catch(err => {
                 console.error(`[/PUMP] Error sending message:`, err.message);
             });
@@ -2547,7 +2548,8 @@ bot.onText(/^\/dump(?:\s|$)/i, async (msg) => {
             // Отправляем ответ пользователю
             bot.sendMessage(
                 chatId,
-                `📉 DUMP! Текущий результат: ${currentResult > 0 ? '+' : ''}${currentResult}\n🛒 Магазин бустов: https://t.me/pumpordumprobot?start=shop`
+                `📉 DUMP! Текущий результат: ${currentResult > 0 ? '+' : ''}${currentResult}\n🛒 Магазин бустов: https://t.me/pumpordumprobot?start=shop`,
+                { disable_web_page_preview: true }
             ).catch(err => {
                 console.error(`[/DUMP] Error sending message:`, err.message);
             });
